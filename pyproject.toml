@@ -5,10 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "emotion_scorer"
 version = "0.1.0"
-description = "Emotion scorer"
+description = "Emotion scorer for TTS output (ESD, WavLM features)"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy",
+    "scipy",
+    "soundfile",
+    "torch",
+    "transformers",
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
