@@ -7,7 +7,7 @@ name = "emotion_scorer"
 version = "0.1.0"
 description = "Emotion scorer for TTS output (ESD, WavLM features)"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "scipy",

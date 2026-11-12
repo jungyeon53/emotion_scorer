@@ -152,10 +152,13 @@ def train(features_npy, index_path, csv_path, out_path, max_epochs=config.MAX_EP
         "std": torch.from_numpy(std),
         "labels": list(config.LABELS),
         "model_name": config.MODEL_NAME,
+        "preprocess": config.preprocess_config(),
         "best_epoch": best_epoch,
         "best_eval_acc": best_acc,
     }, out_path)
-    out_path.with_suffix(".report.txt").write_text(report + "\n", encoding="utf-8")
+    history_lines = ["", f"학습 기록 (최고 모델: epoch {best_epoch}):", "  epoch  train_loss  eval_acc"]
+    history_lines += [f"  {h['epoch']:>5}  {h['train_loss']:>10.4f}  {h['eval_acc']:>8.4f}" for h in history]
+    out_path.with_suffix(".report.txt").write_text(report + "\n" + "\n".join(history_lines) + "\n", encoding="utf-8")
     print(f"저장: {out_path}")
     return history, m
 

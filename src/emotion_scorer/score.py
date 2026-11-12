@@ -36,6 +36,9 @@ def load_classifier(path, device):
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     if ckpt["labels"] != config.LABELS or ckpt["model_name"] != config.MODEL_NAME:
         raise ValueError("체크포인트의 라벨 순서/모델 이름이 config와 다름")
+    saved, current = ckpt.get("preprocess"), config.preprocess_config()
+    if saved != current:
+        raise ValueError(f"체크포인트 전처리 설정 {saved} != 현재 config {current}. 같은 전처리로 다시 학습하세요.")
     model = LayerWeightedClassifier()
     model.load_state_dict(ckpt["state_dict"])
     return model.to(device).eval(), ckpt["mean"].to(device), ckpt["std"].to(device)

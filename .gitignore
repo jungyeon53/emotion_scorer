@@ -14,3 +14,8 @@ data/
 features/
 checkpoints/
 outputs/
+*.wav
+*.flac
+*.npy
+*.pt
+scores*.csv
