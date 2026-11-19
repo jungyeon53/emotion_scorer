@@ -12,10 +12,16 @@ build/
 .vscode/
 data/
 features/
-checkpoints/
+features_sample/
+checkpoints/*
+checkpoints_sample/
 outputs/
 *.wav
 *.flac
 *.npy
 *.pt
 scores*.csv
+
+# 채점 기준으로 고정한 체크포인트는 커밋한다
+!checkpoints/v1/
+!checkpoints/v1/*.pt

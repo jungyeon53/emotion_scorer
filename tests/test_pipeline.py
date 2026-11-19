@@ -318,3 +318,24 @@ def test_13_dataset_meta_in_checkpoint(fake_trained, fake_trained_holdout):
     print(f"\n[13] dataset_meta: {with_meta['dataset_meta']}")
     assert with_meta["dataset_meta"] == FAKE_META
     assert without_meta["dataset_meta"] is None
+
+
+def test_14_refuses_to_overwrite_checkpoint(fake_trained_holdout, tmp_path, capsys):
+    """기존 체크포인트(채점 기준)는 --overwrite 없이는 덮어쓰지 않는다."""
+    d = fake_trained_holdout[0]
+    out = tmp_path / "clf.pt"
+    out.write_bytes(b"existing")
+    args = ["--features", str(d / "f.npy"), "--index", str(d / "idx.txt"), "--csv", str(d / "utts.csv"),
+            "--out", str(out)]
+    with pytest.raises(SystemExit) as e:
+        train_classifier.main(args)
+    assert e.value.code == 1
+    assert "경고: 체크포인트" in capsys.readouterr().err
+    assert out.read_bytes() == b"existing"  # 학습 전에 멈춰서 그대로
+    assert not out.with_suffix(".report.txt").exists()
+    with pytest.raises(FileExistsError):
+        train_classifier.train(d / "f.npy", d / "idx.txt", d / "utts.csv", out)
+
+    train_classifier.main(args + ["--overwrite"])
+    assert torch.load(out, weights_only=True)["holdout_speakers"] == ["0013", "0014"]
+    print(f"\n[14] 덮어쓰기 막힘 → --overwrite로 덮어씀")

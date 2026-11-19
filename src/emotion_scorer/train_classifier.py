@@ -5,6 +5,7 @@ holdout split(처음 보는 화자)이 있으면 test처럼 마지막에 한 번
 최고 모델 선택·정규화 값 계산에는 쓰지 않는다.
 CSV와 같은 폴더에 meta.json(build_manifest --revision이 만든 데이터셋 버전 기록)이 있으면
 그 내용을 체크포인트의 dataset_meta에 같이 저장한다 (없으면 None).
+--out에 체크포인트가 이미 있으면 경고하고 멈춘다 (채점 기준 보호). 덮어쓰려면 --overwrite.
 
 실행:
     python -m emotion_scorer.train_classifier --csv data/utterances.csv \
@@ -126,7 +127,15 @@ def format_speaker_report(test_m: dict, holdout_m: dict | None, by_speaker: dict
     return "\n".join(lines)
 
 
-def train(features_npy, index_path, csv_path, out_path, max_epochs=config.MAX_EPOCHS):
+def check_overwrite(out_path, overwrite: bool):
+    """기존 체크포인트를 실수로 덮어쓰지 않도록, 있으면 학습 전에 멈춘다."""
+    if Path(out_path).exists() and not overwrite:
+        raise FileExistsError(f"경고: 체크포인트 {out_path}가 이미 있어 멈춤. "
+                              f"덮어쓰려면 --overwrite, 아니면 다른 --out을 지정하세요.")
+
+
+def train(features_npy, index_path, csv_path, out_path, max_epochs=config.MAX_EPOCHS, overwrite=False):
+    check_overwrite(out_path, overwrite)
     set_seed(config.SEED)
     device = config.get_device()
     feats, labels, splits, speakers = load_dataset(features_npy, index_path, csv_path)
@@ -230,8 +239,12 @@ def main(argv=None):
     ap.add_argument("--features", type=Path, default=config.FEATURES_NPY)
     ap.add_argument("--index", type=Path, default=config.FEATURES_INDEX)
     ap.add_argument("--out", type=Path, default=config.CHECKPOINT)
+    ap.add_argument("--overwrite", action="store_true", help="--out에 체크포인트가 이미 있어도 덮어씀")
     args = ap.parse_args(argv)
-    train(args.features, args.index, args.csv, args.out)
+    try:
+        train(args.features, args.index, args.csv, args.out, overwrite=args.overwrite)
+    except FileExistsError as e:
+        ap.exit(1, f"{e}\n")
 
 
 if __name__ == "__main__":
