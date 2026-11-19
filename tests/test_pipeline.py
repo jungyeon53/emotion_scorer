@@ -3,6 +3,7 @@
 """
 
 import csv
+import json
 
 import numpy as np
 import pytest
@@ -13,6 +14,9 @@ from emotion_scorer import config, extract_features, score, train_classifier
 from emotion_scorer.audio import FRAME_SEC, load_audio
 
 FIELDS = extract_features.CSV_COLUMNS
+FAKE_META = {"dataset": "jspaulsen/esd", "revision": "abc123", "created_at": "2026-11-19T10:00:00+09:00",
+             "holdout_speakers": ["0013", "0014"], "speaker_genders": {"0011": "male", "0012": "female",
+                                                                       "0013": "male", "0014": "female"}}
 
 
 def sine(sr, seconds, freq, channels=1):
@@ -72,6 +76,32 @@ def fake_trained(tmp_path_factory):
     (d / "idx.txt").write_text("".join(r["utt_id"] + "\n" for r in rows))
     history, m = train_classifier.train(d / "f.npy", d / "idx.txt", d / "utts.csv", d / "clf.pt")
     return d / "clf.pt", history, m
+
+
+HOLDOUT_OFFSET = 50.0  # holdout 특징만 크게 밀어 두면 mean/std에 섞였는지 바로 드러난다
+
+
+@pytest.fixture(scope="module")
+def fake_trained_holdout(tmp_path_factory):
+    """train/eval/test는 화자 0011·0012, holdout은 화자 0013·0014인 가짜 데이터로 학습."""
+    d = tmp_path_factory.mktemp("train_holdout")
+    rng = np.random.default_rng(1)
+    plan = [("train", "0011"), ("train", "0012")] * 100 + [("eval", "0011"), ("eval", "0012")] * 25 \
+        + [("test", "0011"), ("test", "0012")] * 25 + [("holdout", "0013"), ("holdout", "0014")] * 30
+    feats = rng.normal(size=(len(plan), config.NUM_LAYERS, config.HIDDEN_SIZE)).astype(np.float32)
+    is_holdout = np.array([s == "holdout" for s, _ in plan])
+    feats[is_holdout] += HOLDOUT_OFFSET
+    np.save(d / "f.npy", feats.astype(np.float16))
+    rows = [
+        dict(utt_id=f"u{i:03d}", speaker=spk, emotion=config.LABELS[rng.integers(5)],
+             sentence_id=str(i), text="x", split=s, path="none.wav", duration="1.0")
+        for i, (s, spk) in enumerate(plan)
+    ]
+    write_csv(d / "utts.csv", rows)
+    (d / "idx.txt").write_text("".join(r["utt_id"] + "\n" for r in rows))
+    (d / "meta.json").write_text(json.dumps(FAKE_META), encoding="utf-8")  # build_manifest --revision이 만드는 파일
+    history, m = train_classifier.train(d / "f.npy", d / "idx.txt", d / "utts.csv", d / "clf.pt")
+    return d, history, m, rows
 
 
 def test_1_extract_shape(extracted):
@@ -208,3 +238,83 @@ def test_8_checkpoint_preprocess_mismatch(fake_trained, tmp_path):
     with pytest.raises(ValueError, match="전처리") as e:
         score.load_classifier(bad, "cpu")
     print(f"\n[8] 예상대로 에러: {e.value}")
+
+
+# ---- 화자 홀드아웃 ----
+
+
+def test_9_no_holdout_checkpoint_speakers(fake_trained):
+    ckpt_path, history, _ = fake_trained
+    ckpt = torch.load(ckpt_path, weights_only=True)
+    assert ckpt["train_speakers"] == ["0011"]
+    assert ckpt["holdout_speakers"] == []
+    report = ckpt_path.with_suffix(".report.txt").read_text(encoding="utf-8")
+    assert report.startswith("[test] 발화 50개\n전체 정확도: ")  # 기존 test 리포트 형식 유지
+    assert "[holdout]" not in report and "[요약]" not in report
+    assert "  test     0011   발화    50개" in report
+    print(f"\n[9] holdout 없음: epochs={len(history)}, train_speakers={ckpt['train_speakers']}")
+
+
+def test_10_holdout_training(fake_trained_holdout):
+    d, history, _, rows = fake_trained_holdout
+    assert len(history) >= 1
+    ckpt = torch.load(d / "clf.pt", weights_only=True)
+    assert ckpt["train_speakers"] == ["0011", "0012"]
+    assert ckpt["holdout_speakers"] == ["0013", "0014"]
+
+    # mean/std는 train 특징으로만 계산되어야 한다 (holdout은 +50으로 밀어 둠)
+    feats = np.load(d / "f.npy").astype(np.float32)
+    split = np.array([r["split"] for r in rows])
+    assert np.allclose(ckpt["mean"].numpy(), feats[split == "train"].mean(axis=0), atol=1e-5)
+    assert np.allclose(ckpt["std"].numpy(), feats[split == "train"].std(axis=0) + 1e-5, atol=1e-5)
+    assert np.abs(ckpt["mean"].numpy()).max() < 1.0  # holdout이 섞였다면 평균이 약 +8 이상
+
+    report = (d / "clf.report.txt").read_text(encoding="utf-8")
+    print(f"\n[10] 리포트 일부:\n" + report.split("층 가중치")[0][-200:] + "...\n"
+          + report[report.index("[holdout]"):report.index("학습 기록")])
+    assert report.startswith("[test] 발화 50개\n")
+    assert "[holdout] 발화 60개" in report
+    assert "[요약] test 정확도 " in report and "| holdout 정확도 " in report and "차이(test - holdout)" in report
+    for spk in ("0011", "0012"):
+        assert f"  test     {spk}   발화    25개" in report
+    for spk in ("0013", "0014"):
+        assert f"  holdout  {spk}   발화    30개" in report
+
+
+def test_11_holdout_speaker_leak_raises(tmp_path):
+    feats = np.zeros((4, config.NUM_LAYERS, config.HIDDEN_SIZE), dtype=np.float16)
+    np.save(tmp_path / "f.npy", feats)
+    rows = [dict(utt_id=f"u{i}", speaker=spk, emotion="neutral", sentence_id=str(i), text="x", split=s,
+                 path="none.wav", duration="1.0")
+            for i, (s, spk) in enumerate([("train", "0011"), ("eval", "0011"), ("test", "0011"), ("holdout", "0011")])]
+    write_csv(tmp_path / "utts.csv", rows)
+    (tmp_path / "idx.txt").write_text("".join(r["utt_id"] + "\n" for r in rows))
+    with pytest.raises(ValueError, match="holdout 화자"):
+        train_classifier.train(tmp_path / "f.npy", tmp_path / "idx.txt", tmp_path / "utts.csv", tmp_path / "c.pt")
+
+
+def test_12_old_checkpoint_without_speakers(fake_trained, fake_trained_holdout, tmp_path):
+    ckpt_path, _, _ = fake_trained
+    old = torch.load(ckpt_path, weights_only=True)
+    del old["train_speakers"], old["holdout_speakers"]
+    old_path = tmp_path / "old.pt"
+    torch.save(old, old_path)
+    score.load_classifier(old_path, "cpu")  # 예전 체크포인트도 그대로 읽힘
+    lines = {
+        "old": score.holdout_speakers_line(old_path),
+        "none": score.holdout_speakers_line(ckpt_path),
+        "holdout": score.holdout_speakers_line(fake_trained_holdout[0] / "clf.pt"),
+    }
+    print("\n" + "\n".join(f"[12] {k}: {v}" for k, v in lines.items()))
+    assert lines["old"].startswith("이 분류기가 학습에서 보지 않은 화자: 기록 없음")
+    assert lines["none"] == "이 분류기가 학습에서 보지 않은 화자: 없음"
+    assert lines["holdout"] == "이 분류기가 학습에서 보지 않은 화자: 0013, 0014"
+
+
+def test_13_dataset_meta_in_checkpoint(fake_trained, fake_trained_holdout):
+    """CSV 옆 meta.json이 있으면 체크포인트에 그대로, 없으면 None."""
+    with_meta = torch.load(fake_trained_holdout[0] / "clf.pt", weights_only=True)
+    without_meta = torch.load(fake_trained[0], weights_only=True)
+    print(f"\n[13] dataset_meta: {with_meta['dataset_meta']}")
+    assert with_meta["dataset_meta"] == FAKE_META
+    assert without_meta["dataset_meta"] is None

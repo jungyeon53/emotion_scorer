@@ -1,6 +1,10 @@
 """특징 파일 + 발화 목록 → 층 가중합 분류기.
 
 train으로 학습, eval 정확도로 early stopping/최고 모델 선택, test는 마지막에 한 번만 평가.
+holdout split(처음 보는 화자)이 있으면 test처럼 마지막에 한 번만 평가하고, 학습·early stopping·
+최고 모델 선택·정규화 값 계산에는 쓰지 않는다.
+CSV와 같은 폴더에 meta.json(build_manifest --revision이 만든 데이터셋 버전 기록)이 있으면
+그 내용을 체크포인트의 dataset_meta에 같이 저장한다 (없으면 None).
 
 실행:
     python -m emotion_scorer.train_classifier --csv data/utterances.csv \
@@ -10,6 +14,7 @@ train으로 학습, eval 정확도로 early stopping/최고 모델 선택, test�
 
 import argparse
 import copy
+import json
 import random
 from pathlib import Path
 
@@ -37,6 +42,14 @@ class LayerWeightedClassifier(nn.Module):
         return self.linear(pooled)
 
 
+def read_dataset_meta(csv_path) -> dict | None:
+    """CSV 옆 meta.json → dict. 없으면 None."""
+    meta_path = Path(csv_path).parent / "meta.json"
+    if not meta_path.exists():
+        return None
+    return json.loads(meta_path.read_text(encoding="utf-8"))
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -44,7 +57,7 @@ def set_seed(seed: int):
 
 
 def load_dataset(features_npy, index_path, csv_path):
-    """특징 [N,13,768] float32, 라벨 [N], split [N]을 utt_id로 맞춰서 돌려준다."""
+    """특징 [N,13,768] float32, 라벨 [N], split [N], 화자 [N]을 utt_id로 맞춰서 돌려준다."""
     feats = np.load(features_npy).astype(np.float32)
     utt_ids = Path(index_path).read_text(encoding="utf-8").split()
     if len(utt_ids) != len(feats):
@@ -56,7 +69,8 @@ def load_dataset(features_npy, index_path, csv_path):
     label_of = {name: i for i, name in enumerate(config.LABELS)}
     labels = np.array([label_of[rows[u]["emotion"].strip().lower()] for u in utt_ids], dtype=np.int64)
     splits = np.array([rows[u]["split"].strip().lower() for u in utt_ids])
-    return feats, labels, splits
+    speakers = np.array([rows[u]["speaker"].strip() for u in utt_ids])
+    return feats, labels, splits, speakers
 
 
 @torch.no_grad()
@@ -77,32 +91,67 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"accuracy": float(tp.sum() / max(cm.sum(), 1)), "recall": recall, "macro_f1": float(f1.mean()), "cm": cm}
 
 
-def format_report(m: dict, layer_weights: np.ndarray, n_test: int) -> str:
-    lines = [f"[test] 발화 {n_test}개", f"전체 정확도: {m['accuracy']:.4f}", f"macro F1: {m['macro_f1']:.4f}", "감정별 정답률:"]
-    lines += [f"  {name:<9} {r:.4f}" for name, r in zip(config.LABELS, m["recall"])]
+def format_split_report(name: str, m: dict, n: int) -> str:
+    """한 split의 정확도, macro F1, 감정별 정답률, 혼동 행렬 (test와 holdout이 같은 형식을 쓴다)."""
+    lines = [f"[{name}] 발화 {n}개", f"전체 정확도: {m['accuracy']:.4f}", f"macro F1: {m['macro_f1']:.4f}", "감정별 정답률:"]
+    lines += [f"  {label:<9} {r:.4f}" for label, r in zip(config.LABELS, m["recall"])]
     lines.append("혼동 행렬 (행=정답, 열=예측):")
-    lines.append(" " * 10 + "".join(f"{n[:7]:>8}" for n in config.LABELS))
-    lines += [f"  {name:<8}" + "".join(f"{v:>8d}" for v in row) for name, row in zip(config.LABELS, m["cm"])]
-    lines.append("층 가중치 (0=CNN 출력, 1~12=트랜스포머 층):")
+    lines.append(" " * 10 + "".join(f"{label[:7]:>8}" for label in config.LABELS))
+    lines += [f"  {label:<8}" + "".join(f"{v:>8d}" for v in row) for label, row in zip(config.LABELS, m["cm"])]
+    return "\n".join(lines)
+
+
+def format_report(m: dict, layer_weights: np.ndarray, n_test: int) -> str:
+    lines = [format_split_report("test", m, n_test), "층 가중치 (0=CNN 출력, 1~12=트랜스포머 층):"]
     lines += [f"  layer {i:>2}: {w:.4f}" for i, w in enumerate(layer_weights)]
+    return "\n".join(lines)
+
+
+def per_speaker_accuracy(y_true, y_pred, speakers) -> list[tuple[str, int, float]]:
+    """[(화자, 발화 수, 정확도)] 화자 순서대로."""
+    return [(s, int((speakers == s).sum()), float((y_pred[speakers == s] == y_true[speakers == s]).mean()))
+            for s in sorted(set(speakers.tolist()))]
+
+
+def format_speaker_report(test_m: dict, holdout_m: dict | None, by_speaker: dict) -> str:
+    """test vs holdout 요약 한 줄 + 화자별 정확도. holdout_m이 None이면 요약 줄은 생략."""
+    lines = [""]
+    if holdout_m is not None:
+        gap = test_m["accuracy"] - holdout_m["accuracy"]
+        lines.append(f"[요약] test 정확도 {test_m['accuracy']:.4f} | holdout 정확도 {holdout_m['accuracy']:.4f}"
+                     f" | 차이(test - holdout) {gap:+.4f}")
+    lines.append("화자별 정확도:")
+    for split, rows in by_speaker.items():
+        lines += [f"  {split:<8} {spk:<6} 발화 {n:>5}개  정확도 {acc:.4f}" for spk, n, acc in rows]
     return "\n".join(lines)
 
 
 def train(features_npy, index_path, csv_path, out_path, max_epochs=config.MAX_EPOCHS):
     set_seed(config.SEED)
     device = config.get_device()
-    feats, labels, splits = load_dataset(features_npy, index_path, csv_path)
+    feats, labels, splits, speakers = load_dataset(features_npy, index_path, csv_path)
+    dataset_meta = read_dataset_meta(csv_path)
+    if dataset_meta is None:
+        print("경고: CSV 옆에 meta.json이 없어 데이터셋 버전을 체크포인트에 기록하지 않음")
+    else:
+        print(f"데이터셋: {dataset_meta.get('dataset')} revision {dataset_meta.get('revision')}")
     for s in ("train", "eval", "test"):
         if not (splits == s).any():
             raise ValueError(f"split '{s}' 발화가 없음")
 
     tr, ev, te = splits == "train", splits == "eval", splits == "test"
-    # 정규화 값은 train 특징으로만 계산 (층별·차원별 [13, 768])
+    ho = splits == "holdout"  # 선택: 없으면 holdout 평가를 건너뜀
+    train_speakers = sorted(set(speakers[tr].tolist()))
+    holdout_speakers = sorted(set(speakers[ho].tolist()))
+    leaked = set(holdout_speakers) & set(speakers[tr | ev | te].tolist())
+    if leaked:
+        raise ValueError(f"holdout 화자 {sorted(leaked)}가 train/eval/test에도 있음 (홀드아웃이 아님)")
+    # 정규화 값은 train 특징으로만 계산 (층별·차원별 [13, 768]). eval/test/holdout은 쓰지 않는다.
     mean = feats[tr].mean(axis=0)
     std = feats[tr].std(axis=0) + 1e-5
     x = torch.from_numpy((feats - mean) / std)
     y = torch.from_numpy(labels)
-    print(f"device={device}, train {tr.sum()} / eval {ev.sum()} / test {te.sum()}")
+    print(f"device={device}, train {tr.sum()} / eval {ev.sum()} / test {te.sum()} / holdout {ho.sum()}")
 
     model = LayerWeightedClassifier().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=config.LR)
@@ -138,10 +187,19 @@ def train(features_npy, index_path, csv_path, out_path, max_epochs=config.MAX_EP
     model.load_state_dict(best_state)
     print(f"최고 모델: epoch {best_epoch}, eval_acc {best_acc:.4f}")
 
-    # test는 여기서 한 번만
-    m = metrics(labels[te], predict(model, x[te], device))
+    # test와 holdout은 최고 모델 선택이 끝난 뒤 여기서 한 번만
+    pred_te = predict(model, x[te], device)
+    m = metrics(labels[te], pred_te)
     layer_weights = model.layer_weights().detach().cpu().numpy()
     report = format_report(m, layer_weights, int(te.sum()))
+    by_speaker = {"test": per_speaker_accuracy(labels[te], pred_te, speakers[te])}
+    m_ho = None
+    if ho.any():
+        pred_ho = predict(model, x[ho], device)
+        m_ho = metrics(labels[ho], pred_ho)
+        by_speaker["holdout"] = per_speaker_accuracy(labels[ho], pred_ho, speakers[ho])
+        report += "\n\n" + format_split_report("holdout", m_ho, int(ho.sum()))
+    report += "\n" + format_speaker_report(m, m_ho, by_speaker)
     print(report)
 
     out_path = Path(out_path)
@@ -155,6 +213,9 @@ def train(features_npy, index_path, csv_path, out_path, max_epochs=config.MAX_EP
         "preprocess": config.preprocess_config(),
         "best_epoch": best_epoch,
         "best_eval_acc": best_acc,
+        "train_speakers": train_speakers,
+        "holdout_speakers": holdout_speakers,
+        "dataset_meta": dataset_meta,
     }, out_path)
     history_lines = ["", f"학습 기록 (최고 모델: epoch {best_epoch}):", "  epoch  train_loss  eval_acc"]
     history_lines += [f"  {h['epoch']:>5}  {h['train_loss']:>10.4f}  {h['eval_acc']:>8.4f}" for h in history]

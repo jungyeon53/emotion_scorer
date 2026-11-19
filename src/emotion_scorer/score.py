@@ -32,7 +32,19 @@ def collect_paths(inputs) -> list[Path]:
     return paths
 
 
+def holdout_speakers_line(path) -> str:
+    """체크포인트의 holdout 화자 한 줄. 화자 정보가 없는 예전 체크포인트도 읽는다."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    holdout = ckpt.get("holdout_speakers")
+    if holdout is None:
+        shown = "기록 없음 (화자 정보를 저장하기 전의 체크포인트)"
+    else:
+        shown = ", ".join(holdout) if holdout else "없음"
+    return f"이 분류기가 학습에서 보지 않은 화자: {shown}"
+
+
 def load_classifier(path, device):
+    """train_speakers/holdout_speakers는 읽지 않으므로 이 값이 없는 예전 체크포인트도 그대로 읽힌다."""
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     if ckpt["labels"] != config.LABELS or ckpt["model_name"] != config.MODEL_NAME:
         raise ValueError("체크포인트의 라벨 순서/모델 이름이 config와 다름")
@@ -67,6 +79,7 @@ def main(argv=None):
     ap.add_argument("--out", type=Path, default=Path("scores.csv"))
     args = ap.parse_args(argv)
 
+    print(holdout_speakers_line(args.checkpoint))
     paths = collect_paths(args.inputs)
     print(f"파일 {len(paths)}개")
     results = score_files(paths, args.checkpoint)
